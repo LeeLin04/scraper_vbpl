@@ -37,3 +37,7 @@ test-results/
 # Temporary files
 *.tmp
 *.temp
+
+# Scripts
+clear.py
+upgrade.py

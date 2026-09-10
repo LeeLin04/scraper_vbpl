@@ -21,7 +21,7 @@ from utils.text_utils import slugify_key
 
 def save_document(document: dict, output_dir: str = OUTPUT_DIR) -> str:
     """
-    Lưu một văn bản thành file JSON và file TXT tóm tắt.
+    Lưu một văn bản thành file JSON phẳng và file TXT dễ đọc.
     Trả về đường dẫn file JSON đã lưu.
 
     Cấu trúc file output:
@@ -41,27 +41,30 @@ def save_document(document: dict, output_dir: str = OUTPUT_DIR) -> str:
 
     # --- TXT (dễ đọc) ---
     txt_path = os.path.join(output_dir, f"{document_key}.txt")
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write(f"TÊN VĂN BẢN : {document.get('title', '')}\n")
-        f.write(f"SỐ VĂN BẢN  : {document.get('doc_number', '')}\n")
-        f.write(f"LOẠI VĂN BẢN: {document.get('doc_type', '')}\n")
-        f.write(f"TỪ KHÓA     : {document.get('keyword', '')}\n")
-        f.write(f"TRẠNG THÁI  : {document.get('status', '')}\n")
-        f.write(f"NGÀY BAN HÀNH: {document.get('issued_date', '')}\n")
-        f.write(f"NGÀY HIỆU LỰC: {document.get('effective_date', '')}\n")
-        f.write(f"URL         : {document.get('source_url', '')}\n")
-        f.write("=" * 80 + "\n\n")
+    with open(txt_path, "w", encoding="utf-8") as f_txt:
+        f_txt.write(f"TÊN VĂN BẢN: {document.get('title', '')}\n")
+        f_txt.write(f"SỐ VĂN BẢN: {document.get('doc_number', '')}\n")
+        f_txt.write(f"TỪ KHÓA: {document.get('keyword', '')}\n")
+        f_txt.write(f"TRẠNG THÁI: {document.get('status', '')}\n")
+        f_txt.write(f"NGÀY ÁP DỤNG: {document.get('effective_date', '')}\n")
+        f_txt.write(f"URL: {document.get('source_url', '')}\n")
+        f_txt.write("="*80 + "\n\n")
 
-        for dieu in document.get("content_tree", []):
-            f.write(f"{'─'*60}\n")
-            f.write(f"{dieu.get('number', '')} – {dieu.get('title', '')}")
-            if dieu.get("label"):
-                f.write(f"  [{dieu['label']}]")
-            f.write("\n\n")
+        for art in document.get("articles", []):
+            if "Điều" in art:
+                f_txt.write(f"--- {art.get('Điều')} - {art.get('Title', '')} ---\n")
+            elif "Khoản" in art:
+                f_txt.write(f"  [{art.get('Khoản')}]\n")
+            elif "Điểm" in art:
+                f_txt.write(f"    [{art.get('Điểm')}]\n")
+            
+            f_txt.write(f"{art.get('Content', '')}\n")
 
-            for khoan in dieu.get("children", []):
-                f.write(f"  {khoan.get('number', '')}.\n")
-                f.write(f"  {khoan.get('content', '')}\n\n")
+            amendment = art.get('Amendment')
+            if amendment:
+                f_txt.write(f"  >> [SỬA ĐỔI, BỔ SUNG]:\n{amendment}\n")
+
+            f_txt.write("\n")
 
     return json_path
 

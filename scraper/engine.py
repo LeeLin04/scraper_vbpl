@@ -8,6 +8,10 @@ Chứa toàn bộ logic:
 
 FIX: Lỗi luôn lấy trùng Modal #1 đã được sửa: dùng Playwright Locator trực tiếp
      thay vì parse page.content() qua BeautifulSoup.
+UPGRADE: source_key (trước đây gọi target_key) giờ chỉ được xác định MỘT LẦN,
+     từ vị trí thật của nút trên trang (DOM traversal, 3 bước: ancestor →
+     sibling lùi → sibling xuôi), TRƯỚC khi click mở Modal. Đã bỏ hẳn đoạn
+     tính lại key từ nội dung Modal (source of sai lệch Khoản/Điểm).
 """
 
 import re
@@ -107,29 +111,100 @@ def _fetch_content_pass(page, url: str, log_fn=None) -> tuple | None:
 
                 button_index += 1
 
-                # Lấy ngữ cảnh Điều/Khoản/Điểm gần nhất qua DOM traversal
-                context_info = btn.evaluate("""
+                # Lấy ngữ cảnh Điều/Khoản/Điểm gần nhất qua DOM traversal.
+                # UPGRADE (từ app4.py): chiến lược 3 bước, vì badge "Điều khoản được
+                # sửa đổi, bổ sung" có thể xuất hiện ở nhiều vị trí khác nhau trong DOM:
+                #   1) Nút nằm BÊN TRONG một Khoản/Điểm/Điều (phổ biến nhất)
+                #      -> tìm ancestor gần nhất khớp mẫu, loại trừ text của chính nút.
+                #   2) Nút là sibling ĐỨNG SAU Khoản/Điểm/Điều mà nó mô tả
+                #      -> tìm ngược lại (previousElementSibling), như bản cũ.
+                #   3) Nút là sibling ĐỨNG TRƯỚC Khoản/Điểm mà nó mô tả (vd: badge báo
+                #      "sắp bổ sung khoản/điểm mới" chèn ngay trước khối đó)
+                #      -> tìm xuôi (nextElementSibling).
+                # Đồng thời nới lỏng selector: không chỉ khớp thẻ <p>, mà khớp bất kỳ
+                # phần tử nào có class .prov-article/.prov-clause/.prov-item HOẶC có
+                # text khớp regex tương ứng — để không bỏ sót khi VBPL đổi cấu trúc thẻ.
+                context_info = btn.evaluate(r"""
                     (element) => {
-                        let curr = element;
-                        let item_text = null, clause_text = null, article_text = null;
-                        while (curr && curr !== document.body) {
-                            let sib = curr.previousElementSibling;
-                            while (sib) {
-                                if (!item_text && !clause_text && !article_text
-                                        && sib.matches('p.prov-item'))
-                                    item_text = sib.innerText.trim();
-                                if (!clause_text && !article_text
-                                        && sib.matches('p.prov-clause'))
-                                    clause_text = sib.innerText.trim();
-                                if (!article_text && sib.matches('p.prov-article')) {
-                                    article_text = sib.innerText.trim();
-                                    break;
-                                }
-                                sib = sib.previousElementSibling;
-                            }
-                            if (article_text) break;
-                            curr = curr.parentElement;
+                        let item_text = null;
+                        let clause_text = null;
+                        let article_text = null;
+
+                        function isDieu(txt, el) {
+                            return el.matches('.prov-article') || /^Điều\s+\d+[a-zA-Z]?\s*[\.:]?\s*/i.test(txt);
                         }
+                        function isKhoan(txt, el) {
+                            return el.matches('.prov-clause') || (/^\d+\.\s*/.test(txt) && !el.matches('.prov-item'));
+                        }
+                        function isDiem(txt, el) {
+                            return el.matches('.prov-item') || /^[a-zđĐ]\)\s*/.test(txt);
+                        }
+                        // Text của một element nhưng loại bỏ mọi <button> lồng bên trong,
+                        // để nhãn "Điều khoản được sửa đổi, bổ sung" không tự khớp nhầm.
+                        function textNoButtons(el) {
+                            const clone = el.cloneNode(true);
+                            clone.querySelectorAll('button').forEach(b => b.remove());
+                            return (clone.innerText || '').trim().replace(/\s+/g, ' ');
+                        }
+
+                        // BƯỚC 1: ancestor gần nhất CHỨA nút này
+                        let anc = element.parentElement;
+                        while (anc && anc !== document.body) {
+                            let txt = textNoButtons(anc);
+                            if (txt) {
+                                if (!item_text && isDiem(txt, anc)) item_text = txt;
+                                if (!clause_text && isKhoan(txt, anc)) clause_text = txt;
+                                if (!article_text && isDieu(txt, anc)) { article_text = txt; break; }
+                            }
+                            anc = anc.parentElement;
+                        }
+
+                        // BƯỚC 2: fallback — sibling phía TRƯỚC (nút nằm sau khoản/điểm nó mô tả)
+                        if (!article_text) {
+                            let curr = element;
+                            while (curr && curr !== document.body) {
+                                let sib = curr.previousElementSibling;
+                                while (sib) {
+                                    let txt = (sib.innerText || '').trim().replace(/\s+/g, ' ');
+                                    if (txt) {
+                                        if (!item_text && !clause_text && !article_text && isDiem(txt, sib)) {
+                                            item_text = txt;
+                                        }
+                                        if (!clause_text && !article_text && isKhoan(txt, sib)) {
+                                            clause_text = txt;
+                                        }
+                                        if (!article_text && isDieu(txt, sib)) {
+                                            article_text = txt;
+                                            break;
+                                        }
+                                    }
+                                    sib = sib.previousElementSibling;
+                                }
+                                if (article_text) break;
+                                curr = curr.parentElement;
+                            }
+                        }
+
+                        // BƯỚC 3: fallback — sibling phía SAU (nút đứng trước khoản/điểm mà nó
+                        // mô tả, ví dụ badge báo bổ sung khoản/điểm mới chèn ngay trước khối đó)
+                        if (!clause_text && !item_text) {
+                            let curr = element;
+                            while (curr && curr !== document.body) {
+                                let sib = curr.nextElementSibling;
+                                while (sib) {
+                                    let txt = (sib.innerText || '').trim().replace(/\s+/g, ' ');
+                                    if (txt) {
+                                        if (!item_text && isDiem(txt, sib)) item_text = txt;
+                                        if (!clause_text && isKhoan(txt, sib)) { clause_text = txt; break; }
+                                        if (isDieu(txt, sib)) break;
+                                    }
+                                    sib = sib.nextElementSibling;
+                                }
+                                if (clause_text || item_text) break;
+                                curr = curr.parentElement;
+                            }
+                        }
+
                         return { item: item_text, clause: clause_text, article: article_text };
                     }
                 """)
@@ -137,7 +212,10 @@ def _fetch_content_pass(page, url: str, log_fn=None) -> tuple | None:
                 doc_title = page.title()
                 nghi_dinh = extract_document_number(doc_title) or doc_title
                 document_key = slugify_key(nghi_dinh)
-                target_key = document_key
+                # source_key: xác định DUY NHẤT một lần tại đây, từ vị trí thật của nút
+                # trên trang (DOM traversal), TRƯỚC khi click mở Modal. Modal ở bước sau
+                # CHỈ được coi là nội dung sửa đổi — không dùng để suy ra lại key này.
+                source_key = document_key
 
                 article_text = context_info.get("article", "")
                 clause_text = context_info.get("clause", "")
@@ -146,15 +224,15 @@ def _fetch_content_pass(page, url: str, log_fn=None) -> tuple | None:
                 if article_text:
                     m = re.match(r"Điều\s+(\d+[a-zA-Z]?)", article_text, flags=re.IGNORECASE)
                     if m:
-                        target_key += f"_Dieu_{slugify_key(m.group(1))}"
+                        source_key += f"_Dieu_{slugify_key(m.group(1))}"
                 if clause_text:
                     m = re.match(r"^(\d+)\.\s*", clause_text)
                     if m:
-                        target_key += f"_Khoan_{m.group(1)}"
+                        source_key += f"_Khoan_{m.group(1)}"
                 if item_text:
                     m = re.match(r"^([a-zđĐ])\)\s+", item_text)
                     if m:
-                        target_key += f"_Diem_{slugify_key(m.group(1))}"
+                        source_key += f"_Diem_{slugify_key(m.group(1))}"
 
                 btn.scroll_into_view_if_needed()
                 btn.hover()
@@ -199,40 +277,18 @@ def _fetch_content_pass(page, url: str, log_fn=None) -> tuple | None:
                         modal_text = ""
 
                     if modal_text:
-                        # Tinh chỉnh target_key từ nội dung thực tế của Modal
-                        content_for_key = re.sub(
-                            r"^.*?Chi tiết thay đổi\s*", "", modal_text,
-                            flags=re.IGNORECASE | re.DOTALL,
-                        ).strip()
-
-                        base_key = document_key
-                        if article_text:
-                            m = re.match(
-                                r"Điều\s+(\d+[a-zA-Z]?)", article_text,
-                                flags=re.IGNORECASE,
-                            )
-                            if m:
-                                base_key = f"{document_key}_Dieu_{slugify_key(m.group(1))}"
-
-                        ck = re.match(r"^(\d+)\.\s*", content_for_key)
-                        cd = re.match(r"^([a-zđĐ])\)\s*", content_for_key)
-                        if ck:
-                            target_key = f"{base_key}_Khoan_{ck.group(1)}"
-                        elif cd and clause_text:
-                            pk = re.match(r"^(\d+)\.\s*", clause_text)
-                            if pk:
-                                target_key = f"{base_key}_Khoan_{pk.group(1)}_Diem_{slugify_key(cd.group(1))}"
-                            else:
-                                target_key = f"{base_key}_Diem_{slugify_key(cd.group(1))}"
-                        elif cd:
-                            target_key = f"{base_key}_Diem_{slugify_key(cd.group(1))}"
-
+                        # UPGRADE: KHÔNG tính lại source_key từ nội dung Modal nữa.
+                        # Trước đây đoạn này parse lại modal_text để suy đoán target_key,
+                        # điều đó khiến Modal (nội dung) ghi đè lên vị trí (Khoản/Điều)
+                        # đã xác định đúng từ DOM traversal ở trên -> gây gán sai node
+                        # (ví dụ: nội dung của Khoản 18 lại bị gán vào Khoản 17).
+                        # source_key giữ nguyên như đã xác định TRƯỚC khi click.
                         modified_texts.append({
-                            "target_key": target_key,
+                            "source_key": source_key,
                             "btn_idx": button_index,
                             "content": modal_text,
                         })
-                        log(f"   📌 Đã lấy Box sửa đổi #{button_index}")
+                        log(f"   📌 Đã lấy Box sửa đổi #{button_index} (source_key={source_key})")
 
                 except Exception as e_modal:
                     log(f"   ⚠️ Lỗi đọc Modal #{button_index}: {e_modal}")
@@ -336,12 +392,13 @@ def scrape_url(url: str, keyword: str = "Direct_URL", log_fn=None) -> str | None
             document = build_document(soup, page_text, doc_info, modified_texts)
             file_path = save_document(document)
 
-            content_tree = document.get("content_tree", [])
-            khoan_count = sum(len(d.get("children", [])) for d in content_tree)
+            articles = document.get("articles", [])
+            dieu_count = sum(1 for a in articles if "Điều" in a)
+            khoan_count = sum(1 for a in articles if "Khoản" in a)
 
             log(f"🎉 HOÀN THÀNH: [{title[:60]}...]")
             log(f"   ├── File     : {file_path}")
-            log(f"   ├── Số Điều  : {len(content_tree)}")
+            log(f"   ├── Số Điều  : {dieu_count}")
             log(f"   ├── Số Khoản : {khoan_count}")
             log(f"   └── Sửa đổi  : {len(modified_texts)} modal đã đọc")
 
