@@ -27,6 +27,8 @@ Thumbs.db
 data/
 output/
 *.db
+*.db-wal
+*.db-shm
 
 # Playwright
 playwright-report/
