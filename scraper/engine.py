@@ -34,8 +34,8 @@ def _open_session_pass(page, url: str) -> bool:
     Pass 1: Chỉ mở URL để tạo session / cookie / vượt kiểm tra chống bot.
     Không trích xuất bất kỳ dữ liệu nào.
     """
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(3000)
+    page.goto(url, wait_until="domcontentloaded", timeout=10000)
+    page.wait_for_timeout(1000)
     return True
 
 

@@ -1,13 +1,11 @@
 """
-scraper/parser.py – Bóc tách HTML VBPL thành cấu trúc flat list (Điều, Khoản, Điểm).
+scraper/parser.py – Bóc tách HTML VBPL thành cấu trúc cây JSON Điều → Khoản.
 
-Dựa trên logic mới từ upgrade.py:
-- Trả về danh sách articles phẳng.
-- Điểm được tạo thành các node riêng biệt.
-- Áp dụng sửa đổi bằng cách thêm field Amendment và loại bỏ các child node cũ.
+FIX: Lỗi IndexError khi articles rỗng đã được sửa bằng kiểm tra if articles.
+FIX: Regex tách Điều đã hỗ trợ cả dạng "Điều 5a", "Điều 12b".
+FIX: Nội dung sửa đổi cấp Điểm được map về Khoản cha thay vì bị bỏ qua.
 """
 
-import copy
 import re
 from bs4 import BeautifulSoup
 
@@ -23,121 +21,195 @@ from utils.text_utils import (
 )
 
 
-def text_excluding_buttons(node, sep: str = " ") -> str:
-    """
-    Lấy text của một node NHƯNG loại bỏ nội dung nằm trong các thẻ <button>
-    (vd: nhãn "Điều khoản được sửa đổi, bổ sung"). Nếu không làm vậy, text của
-    nút bấm sẽ bị lẫn thẳng vào Content của Điều/Khoản chứa/đứng cạnh nó.
-    """
-    if node is None:
-        return ""
-    node_copy = copy.deepcopy(node)
-    for btn in node_copy.find_all("button"):
-        btn.decompose()
-    return node_copy.get_text(sep, strip=True)
-
-
 # =========================================================================
-# PARSE CẤU TRÚC ĐIỀU, KHOẢN, ĐIỂM (FLAT)
+# PARSE CẤU TRÚC ĐIỀU → KHOẢN
 # =========================================================================
 
 def parse_articles(soup: BeautifulSoup, document_key: str, doc_number: str) -> list:
     """
-    Tách toàn bộ văn bản theo Điều, Khoản, Điểm thành một danh sách phẳng.
-    Gắn Key định danh chi tiết tới cấp độ sâu nhất có thể.
+    Bóc tách nội dung văn bản theo cấu trúc phân cấp: Điều → Khoản.
+
+    - Điểm không tạo node riêng, nội dung được ghép vào Khoản tương ứng.
+    - Mỗi node Điều chứa danh sách "children" là các Khoản.
+
+    FIX: Hỗ trợ Điều dạng "Điều 5a", "Điều 12b" (thêm [a-zA-Z]? vào Regex).
+    FIX: Kiểm tra `if content_tree` trước khi fallback append để tránh IndexError.
+
+    Trả về: content_tree (list)
     """
-    articles = []
+    content_tree = []
     article_nodes = soup.select(".prov-article")
+
     for article_node in article_nodes:
-        article_text = clean_text(text_excluding_buttons(article_node, " "))
+        article_text = clean_text(article_node.get_text(" ", strip=True))
         if not article_text:
             continue
-        
-        match = re.match(r"Điều\s+(\d+[a-zA-Z]?)\s*[\.:]?\s*(.*)", article_text, flags=re.IGNORECASE | re.DOTALL)
+
+        # FIX: Regex mở rộng hỗ trợ "Điều 5a", "Điều 12b"
+        match = re.match(
+            r"Điều\s+(\d+[a-zA-Z]?)\s*[\.:]?\s*(.*)",
+            article_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
         if not match:
             continue
-            
+
         dieu_number = match.group(1)
         dieu_title = clean_text(match.group(2))
-        
         article_key = f"{document_key}_Dieu_{slugify_key(dieu_number)}"
+
         is_modified = has_amendment_label(article_node)
 
-        # Tạo object Điều
-        articles.append({
-            "Điều": f"Điều {dieu_number}",
-            "Title": dieu_title,
-            "Content": article_text,
-            "Key": article_key,
-            "artical": f"Điều {dieu_number}, {doc_number}",
-            "Label": "Đã sửa" if is_modified else ""
-        })
-        
-        # Bắt đầu duyệt các siblings để tìm Khoản và Điểm
+        dieu_node = {
+            "level": "dieu",
+            "number": f"Điều {dieu_number}",
+            "title": dieu_title,
+            "key": article_key,
+            "citation": f"Điều {dieu_number}, {doc_number}",
+            "label": "Đã sửa" if is_modified else "",
+            "children": [],
+        }
+        content_tree.append(dieu_node)
+
+        # Duyệt sibling để tìm Khoản / Điểm
         curr = article_node.find_next_sibling()
-        curr_khoan_key = article_key
-        curr_khoan_number = ""
+        current_khoan = None
 
         while curr and "prov-article" not in curr.get("class", []):
-            text = clean_text(text_excluding_buttons(curr, " "))
+            text = clean_text(curr.get_text(" ", strip=True))
             if not text:
                 curr = curr.find_next_sibling()
                 continue
-                
+
             cls = curr.get("class", [])
             k_match = re.match(r"^(\d+)\.\s*(.*)", text, flags=re.DOTALL)
             i_match = re.match(r"^([a-zđĐ])\)\s*(.*)", text)
 
-            # Xử lý Khoản
+            # Khoản: có class prov-clause HOẶC regex số "N. ..."
             if "prov-clause" in cls or (k_match and "prov-item" not in cls):
                 if k_match:
                     khoan_num = k_match.group(1)
-                    curr_khoan_number = khoan_num
-                    curr_khoan_key = f"{article_key}_Khoan_{khoan_num}"
-                    
-                    articles.append({
-                        "Khoản": f"Khoản {khoan_num}",
-                        "Title": "",
-                        "Content": text,
-                        "Key": curr_khoan_key,
-                        "artical": f"Khoản {khoan_num} Điều {dieu_number}, {doc_number}",
-                        "Label": "Đã sửa" if has_amendment_label(curr) else ""
-                    })
+                    khoan_key = f"{article_key}_Khoan_{khoan_num}"
+                    current_khoan = {
+                        "level": "khoan",
+                        "number": f"Khoản {khoan_num}",
+                        "content": text,
+                        "key": khoan_key,
+                        "citation": f"Khoản {khoan_num} Điều {dieu_number}, {doc_number}",
+                        "label": "Đã sửa" if has_amendment_label(curr) else "",
+                    }
+                    dieu_node["children"].append(current_khoan)
                 else:
-                    if articles:
-                        articles[-1]["Content"] += "\n" + text
-                    
-            # Xử lý Điểm
+                    # Fallback: prov-clause nhưng không có số Khoản rõ ràng
+                    if current_khoan is not None:
+                        current_khoan["content"] = (
+                            current_khoan.get("content", "") + "\n" + text
+                        ).strip()
+                    elif content_tree:  # FIX: tránh IndexError
+                        dieu_node["title"] = (
+                            dieu_node.get("title", "") + "\n" + text
+                        ).strip()
+
+            # Điểm: có class prov-item HOẶC regex chữ "x) ..."
+            # Không tạo node riêng – ghép vào Khoản hiện tại để giữ ngữ cảnh
             elif "prov-item" in cls or i_match:
-                if i_match:
-                    diem_letter = i_match.group(1)
-                    diem_key = f"{curr_khoan_key}_Diem_{slugify_key(diem_letter)}"
-                    khoan_prefix = f"Khoản {curr_khoan_number} " if curr_khoan_number else ""
-                    
-                    articles.append({
-                        "Điểm": f"Điểm {diem_letter}",
-                        "Title": "",
-                        "Content": text,
-                        "Key": diem_key,
-                        "artical": f"Điểm {diem_letter} {khoan_prefix}Điều {dieu_number}, {doc_number}",
-                        "Label": "Đã sửa" if has_amendment_label(curr) else ""
-                    })
-                else:
-                    if articles:
-                        articles[-1]["Content"] += "\n" + text
-                    
-            # Nội dung bổ sung / text thường
+                if current_khoan is not None:
+                    current_khoan["content"] = (
+                        current_khoan.get("content", "") + "\n" + text
+                    ).strip()
+                elif content_tree:  # FIX: tránh IndexError
+                    dieu_node["title"] = (
+                        dieu_node.get("title", "") + "\n" + text
+                    ).strip()
+
+            # Nội dung bổ sung không có class / regex rõ ràng
             else:
-                if articles:
-                    articles[-1]["Content"] += "\n" + text
+                if current_khoan is not None:
+                    current_khoan["content"] = (
+                        current_khoan.get("content", "") + "\n" + text
+                    ).strip()
+                elif content_tree:  # FIX: tránh IndexError
+                    dieu_node["title"] = (
+                        dieu_node.get("title", "") + "\n" + text
+                    ).strip()
 
             curr = curr.find_next_sibling()
 
-    return articles
+    return content_tree
 
 
 # =========================================================================
-# MAP NỘI DUNG SỬA ĐỔI VÀ XÂY DỰNG JSON
+# MAP NỘI DUNG SỬA ĐỔI TỪ MODAL VÀO CÂY
+# =========================================================================
+
+def find_node(nodes: list, target_key: str) -> dict | None:
+    """
+    Tìm kiếm đệ quy một node trong content_tree theo key.
+    """
+    for node in nodes:
+        if node.get("key") == target_key:
+            return node
+        found = find_node(node.get("children", []), target_key)
+        if found:
+            return found
+    return None
+
+
+def apply_modal_updates(content_tree: list, modified_texts: list) -> None:
+    """
+    Cập nhật nội dung mới và bổ sung nội dung cũ từ Modal sửa đổi.
+
+    FIX: Nếu target_key trỏ đến level Điểm (_Diem_x) nhưng cây không có node
+         riêng cho Điểm, hàm sẽ tự động tìm Khoản cha và cập nhật vào đó.
+
+    Thực hiện in-place, không có giá trị trả về.
+    """
+    for mod in modified_texts:
+        if not isinstance(mod, dict):
+            continue
+        target_key: str = mod.get("target_key", "")
+        raw_content: str = mod.get("content", "")
+        if not target_key or not raw_content:
+            continue
+
+        # Lọc bỏ phần metadata "Chi tiết thay đổi ..." ở đầu nội dung Modal
+        clean_content = re.sub(
+            r"^.*?Chi tiết thay đổi\s*", "", raw_content,
+            flags=re.IGNORECASE | re.DOTALL,
+        ).strip()
+
+        is_old_content = target_key.endswith("_cu")
+        lookup_key = target_key[:-3] if is_old_content else target_key
+
+        # Tìm chính xác node trong cây
+        node = find_node(content_tree, lookup_key)
+
+        if node is None:
+            # FIX: Nếu key có dạng _Diem_x (không có node riêng),
+            # cắt phần _Diem_x và tìm Khoản cha để cập nhật vào đó.
+            parent_key = re.sub(r"_Diem_[^_]+$", "", lookup_key)
+            if parent_key != lookup_key:
+                node = find_node(content_tree, parent_key)
+
+        if node is None:
+            continue
+
+        if node.get("level") == "khoan":
+            if is_old_content:
+                node["old_content"] = clean_content
+            else:
+                node["content"] = clean_content
+                node["label"] = "Đã cập nhật"
+        elif node.get("level") == "dieu":
+            if is_old_content:
+                node["old_content"] = clean_content
+            else:
+                node["title"] = clean_content
+                node["label"] = "Đã cập nhật"
+
+
+# =========================================================================
+# XÂY DỰNG DOCUMENT JSON HOÀN CHỈNH
 # =========================================================================
 
 def build_document(
@@ -147,7 +219,10 @@ def build_document(
     modified_texts: list | None = None,
 ) -> dict:
     """
-    Tạo document JSON phẳng, tích hợp các nội dung sửa đổi vào trường Amendment.
+    Tổng hợp tất cả thông tin thành một document JSON hoàn chỉnh.
+
+    doc_info: { "title", "keyword", "status", "issued_date",
+                "effective_date", "source_url" }
     """
     title = doc_info.get("title", "")
     keyword = doc_info.get("keyword", "")
@@ -160,9 +235,12 @@ def build_document(
     doc_type = extract_document_type(title)
     document_key = slugify_key(doc_number)
 
-    articles = parse_articles(soup, document_key, doc_number)
+    content_tree = parse_articles(soup, document_key, doc_number)
 
-    document = {
+    if modified_texts:
+        apply_modal_updates(content_tree, modified_texts)
+
+    return {
         "title": title,
         "doc_number": doc_number,
         "doc_type": doc_type,
@@ -171,43 +249,5 @@ def build_document(
         "effective_date": effective_date,
         "status": status,
         "source_url": source_url,
-        "articles": articles,
+        "content_tree": content_tree,
     }
-
-    if modified_texts:
-        matched_source_keys = set()
-        for mod in modified_texts:
-            if not isinstance(mod, dict):
-                continue
-            
-            s_key = mod.get("source_key") or mod.get("target_key", "")
-            m_content = mod.get("content", "")
-            if not s_key or not m_content:
-                continue
-                
-            for art in document.get("articles", []):
-                if art.get("Key") == s_key:
-                    clean_m_content = re.sub(
-                        r"^.*?Chi tiết thay đổi\s*", "", m_content,
-                        flags=re.IGNORECASE | re.DOTALL,
-                    ).strip()
-                    
-                    existing = art.get("Amendment")
-                    if existing:
-                        art["Amendment"] = existing + "\n---\n" + clean_m_content
-                    else:
-                        art["Amendment"] = clean_m_content
-                    art["Label"] = "Đã cập nhật sửa đổi"
-                    matched_source_keys.add(s_key)
-        
-        # Xóa các khoản/điểm con cũ thuộc Điều/Khoản đã bị Amendment thay thế
-        if matched_source_keys:
-            document["articles"] = [
-                art for art in document.get("articles", [])
-                if not any(
-                    art.get("Key", "").startswith(pk + "_")
-                    for pk in matched_source_keys
-                )
-            ]
-
-    return document
