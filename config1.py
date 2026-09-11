@@ -21,12 +21,12 @@ BASE_URL = "https://vbpl.vn"
 #       "urls": ["https://vbpl.vn/...", "https://vbpl.vn/..."]
 #   }
 # -------------------------------------------------------------------------
-KEY_PATH = r"D:\A_WORK\TGA\chatbot3\scraper_vbpl-main\key3.json"
+KEY_PATH = r"D:\A_WORK\TGA\chatbot3\scraper_vbpl-main\key4.json"
 
 # -------------------------------------------------------------------------
 # THƯ MỤC LƯU KẾT QUẢ (JSON + TXT)
 # -------------------------------------------------------------------------
-OUTPUT_DIR = "PL"
+OUTPUT_DIR = "PLa"
 
 # -------------------------------------------------------------------------
 # FILE THEO DÕI TIẾN ĐỘ (để Resume khi bị gián đoạn)

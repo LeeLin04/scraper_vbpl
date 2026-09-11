@@ -1,9 +1,4 @@
-"""
-main.py – Điểm khởi chạy duy nhất của VBPL Scraper.
 
-Chạy bằng lệnh:
-    python d:\Data\tttttttt\vbpl_scraper\main.py
-"""
 
 import sys
 import os
