@@ -21,7 +21,7 @@ BASE_URL = "https://vbpl.vn"
 #       "urls": ["https://vbpl.vn/...", "https://vbpl.vn/..."]
 #   }
 # -------------------------------------------------------------------------
-KEY_PATH = r"D:\Data\tttttttt\key3.json"
+KEY_PATH = r"D:\A_WORK\TGA\chatbot3\scraper_vbpl-main\key3.json"
 
 # -------------------------------------------------------------------------
 # THƯ MỤC LƯU KẾT QUẢ (JSON + TXT)
@@ -89,5 +89,5 @@ USER_AGENTS = [
 # -------------------------------------------------------------------------
 # THỜI GIAN CHỜ (giây) GIỮA CÁC TÁC VỤ – Để tránh bị VBPL chặn
 # -------------------------------------------------------------------------
-WAIT_BETWEEN_KEYWORDS = (4, 8)   # random.uniform(min, max)
-WAIT_BETWEEN_URLS     = (2, 6)   # random.uniform(min, max)
+WAIT_BETWEEN_KEYWORDS = (1, 3)   # random.uniform(min, max)
+WAIT_BETWEEN_URLS     = (1, 4)   # random.uniform(min, max)

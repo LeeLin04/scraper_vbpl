@@ -1,23 +1,12 @@
 """
 gui/app_gui.py – Giao diện Tkinter đa luồng cho VBPL Scraper.
 
-KIẾN TRÚC MỚI (SQLite-backed):
-  - Thread Search : duyệt keyword → search_documents() → enqueue_many() vào SQLite
-                    ngay lập tức, không giữ URL trong RAM.
-  - Thread Worker : vòng lặp liên tục fetch_next_pending() → scrape_url() →
-                    mark_done/error. Chạy song song với Thread Search.
-
-  Ưu điểm:
-    - RAM không tăng dù có hàng nghìn URL (URL nằm trên đĩa, trong SQLite).
-    - Crash bất kỳ lúc nào → khởi động lại sẽ tự resume (pending còn trong DB).
-    - Văn bản hết hiệu lực bị lọc ngay từ kết quả search (EXPIRED_POLICY='skip'),
-      đánh dấu 'skipped' trong SQLite, không cào.
-
-Giữ nguyên từ phiên bản cũ:
+Lấy cấu trúc GUI & quản lý luồng tốt nhất từ app.py:
   - PanedWindow 2 cột (Log | Kết quả).
   - 3 trạng thái: Bắt đầu / Tạm dừng / Dừng hẳn bằng threading.Event.
   - Thanh tiến trình Progress Bar.
   - Ghi nhật ký hoạt động Thread-safe (widget.after).
+  - Cơ chế Resume qua progress.json.
 """
 
 import json
@@ -33,17 +22,14 @@ from tkinter import messagebox, scrolledtext
 from playwright.sync_api import sync_playwright
 
 import sys
+import os
 # Đảm bảo import được từ thư mục gốc vbpl_scraper
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import (
-    KEY_PATH, USER_AGENTS,
-    WAIT_BETWEEN_KEYWORDS, WAIT_BETWEEN_URLS,
-    MAX_RETRIES, RETRY_DELAY_SECONDS,
-)
+from config import KEY_PATH, USER_AGENTS, WAIT_BETWEEN_KEYWORDS, WAIT_BETWEEN_URLS, MAX_RETRIES, RETRY_DELAY_SECONDS
 from scraper.api_client import search_documents
 from scraper.engine import scrape_url
-from utils import db_queue
+from utils.storage import load_progress, save_progress
 from utils.text_utils import clean_text
 
 
@@ -79,8 +65,8 @@ class ScraperApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("🏛️ VBPL Scraper — Cào Văn Bản Pháp Luật")
-        self.geometry("1100x680")
-        self.minsize(750, 480)
+        self.geometry("1000x650")
+        self.minsize(700, 450)
         self.resizable(True, True)
 
         # Threading events
@@ -89,17 +75,8 @@ class ScraperApp(tk.Tk):
         self.stop_event = threading.Event()
         self.is_running = False
 
-        # Khởi tạo SQLite DB và reset stuck URLs
-        db_queue.init_db()
-        stuck = db_queue.reset_processing()
-        if stuck > 0:
-            logging.info(f"♻️ Resume: reset {stuck} URL bị stuck về pending.")
-
         self._build_ui()
         self._setup_logging()
-
-        # Cập nhật stats bar định kỳ
-        self._update_stats_bar()
 
     # ------------------------------------------------------------------
     # UI
@@ -139,7 +116,7 @@ class ScraperApp(tk.Tk):
         # Ô nhập URL đơn lẻ
         tk.Label(ctrl_frame, text="  URL đơn:").pack(side=tk.LEFT)
         self._url_var = tk.StringVar()
-        url_entry = tk.Entry(ctrl_frame, textvariable=self._url_var, width=40)
+        url_entry = tk.Entry(ctrl_frame, textvariable=self._url_var, width=45)
         url_entry.pack(side=tk.LEFT, padx=4)
 
         tk.Button(
@@ -161,15 +138,6 @@ class ScraperApp(tk.Tk):
             pg_frame, orient=tk.HORIZONTAL, mode="determinate",
         )
         self._progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-
-        # === Status bar (SQLite stats) ===
-        self._stats_lbl = tk.Label(
-            self,
-            text="DB: Hàng chờ: — | Đang cào: — | Xong: — | Lỗi: — | Bỏ qua: —",
-            font=("Consolas", 8), fg="#555555", anchor="w",
-            relief=tk.SUNKEN, bd=1,
-        )
-        self._stats_lbl.pack(fill=tk.X, padx=10, pady=(0, 3))
 
         # === PanedWindow: Log (trái) | Kết quả (phải) ===
         pane = tk.PanedWindow(
@@ -225,25 +193,6 @@ class ScraperApp(tk.Tk):
         self._progress_lbl.config(text=f"Tiến độ: {current}/{total} từ khóa")
         self._progress_bar["maximum"] = max(total, 1)
         self._progress_bar["value"] = current
-
-    def _update_stats_bar(self):
-        """Cập nhật status bar từ SQLite stats, lên lịch chạy lại sau 3 giây."""
-        try:
-            s = db_queue.get_stats()
-            self._stats_lbl.config(
-                text=(
-                    f"DB — "
-                    f"Hàng chờ: {s['pending']}  |  "
-                    f"Đang cào: {s['processing']}  |  "
-                    f"Xong: {s['done']}  |  "
-                    f"Lỗi: {s['error']}  |  "
-                    f"Bỏ qua: {s['skipped']}  |  "
-                    f"Tổng: {s['total']}"
-                )
-            )
-        except Exception:
-            pass
-        self.after(3000, self._update_stats_bar)
 
     def _append_result(self, title: str, keyword: str, file_path: str):
         def _do():
@@ -319,12 +268,10 @@ class ScraperApp(tk.Tk):
         ).start()
 
     def _run_single_url(self, url: str):
-        # Enqueue trực tiếp, bypass kiểm tra hiệu lực (URL thủ công)
-        db_queue.enqueue_url(url, keyword="Direct_URL", title=url, hieu_luc="Còn hiệu lực")
         scrape_url(url, keyword="Direct_URL", log_fn=self._log)
 
     # ------------------------------------------------------------------
-    # CÀO THEO KEYWORD (từ key.json) — HAI THREAD SONG SONG
+    # CÀO THEO KEYWORD (từ key.json)
     # ------------------------------------------------------------------
 
     def _start_keywords(self):
@@ -334,22 +281,14 @@ class ScraperApp(tk.Tk):
             messagebox.showerror("Lỗi", f"Không tìm thấy file từ khóa:\n{KEY_PATH}")
             return
         self._set_running()
-        # Thread A: tìm kiếm + enqueue
-        threading.Thread(target=self._thread_search, daemon=True).start()
-        # Thread B: worker cào từng URL
-        threading.Thread(target=self._thread_worker, daemon=True).start()
+        threading.Thread(target=self._run_keywords, daemon=True).start()
 
-    # ---- Thread A: Tìm kiếm & enqueue --------------------------------
-
-    def _thread_search(self):
-        """
-        Duyệt từng keyword: search_documents() → enqueue_many() vào SQLite ngay.
-        Không giữ URL trong RAM. Kết thúc sau khi hết keyword.
-        """
+    def _run_keywords(self):
         try:
             with open(KEY_PATH, "r", encoding="utf-8") as f:
                 key_data = json.load(f)
 
+            # --- Đọc danh sách từ khóa ---
             keywords: list[str] = []
             direct_urls: list[str] = []
 
@@ -379,150 +318,112 @@ class ScraperApp(tk.Tk):
             keywords = list(dict.fromkeys(str(k).strip() for k in keywords if str(k).strip()))
             direct_urls = list(dict.fromkeys(direct_urls))
 
-            # Enqueue direct URLs ngay (không qua search, coi là còn hiệu lực)
-            if direct_urls:
-                items = [
-                    {"url": u, "keyword": "Direct_URL", "title": u, "hieu_luc": "Còn hiệu lực"}
-                    for u in direct_urls
-                ]
-                added = db_queue.enqueue_many(items)
-                logging.info(f"📎 Enqueue {added} URL trực tiếp (bỏ qua {len(direct_urls)-added} trùng).")
-
             if not keywords and not direct_urls:
                 logging.warning("⚠️ key.json không có từ khóa hoặc URL.")
                 return
 
-            if not keywords:
-                logging.info("ℹ️ Không có keyword, chỉ có direct URL.")
-                return
+            # --- Bước 1: Tìm kiếm theo từ khóa ---
+            search_results: list[dict] = []
+            seen_search_urls: set[str] = set()
 
-            logging.info(f"🔍 Bắt đầu tìm kiếm {len(keywords)} từ khóa...")
-
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=False)
-                page = browser.new_page(user_agent=USER_AGENTS[0])
-                try:
-                    for idx, kw in enumerate(keywords, 1):
-                        if self._check_events():
-                            break
-
-                        logging.info(f"🔍 [{idx}/{len(keywords)}] Keyword: {kw}")
-                        self.after(0, self._update_progress, idx - 1, len(keywords))
-
-                        docs = []
-                        for attempt in range(1, MAX_RETRIES + 1):
-                            try:
-                                docs = search_documents(page, kw, log_fn=self._log)
+            if keywords:
+                logging.info(f"🔍 Tìm kiếm {len(keywords)} từ khóa...")
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=False)
+                    page = browser.new_page(user_agent=USER_AGENTS[0])
+                    try:
+                        for idx, kw in enumerate(keywords, 1):
+                            if self._check_events():
                                 break
-                            except Exception as e:
-                                logging.warning(f"⚠️ Search lần {attempt}: {e}")
-                                if attempt < MAX_RETRIES:
-                                    time.sleep(RETRY_DELAY_SECONDS)
+                            logging.info(f"🔍 [{idx}/{len(keywords)}] Từ khóa: {kw}")
+                            self.after(0, self._update_progress, idx - 1, len(keywords))
 
-                        # Enqueue ngay vào SQLite — kèm hieu_luc để tự lọc
-                        items = [
-                            {
-                                "url": doc.get("url", ""),
-                                "keyword": kw,
-                                "title": doc.get("title", ""),
-                                "hieu_luc": doc.get("hieu_luc", ""),
-                            }
-                            for doc in docs
-                            if doc.get("url", "")
-                        ]
-                        if items:
-                            added = db_queue.enqueue_many(items)
-                            skipped_hl = sum(
-                                1 for it in items
-                                if it["hieu_luc"] not in ("Còn hiệu lực", "")
-                            )
-                            logging.info(
-                                f"   ✅ Enqueue {added} mới | "
-                                f"Hết/bỏ HiệuLực: {skipped_hl} | "
-                                f"Trùng: {len(items) - added - skipped_hl}"
-                            )
+                            docs = []
+                            for attempt in range(1, MAX_RETRIES + 1):
+                                try:
+                                    docs = search_documents(page, kw, log_fn=self._log)
+                                    break
+                                except Exception as e:
+                                    logging.warning(f"⚠️ Lần {attempt}: {e}")
+                                    if attempt < MAX_RETRIES:
+                                        time.sleep(RETRY_DELAY_SECONDS)
 
-                        if idx < len(keywords):
-                            wait = random.uniform(*WAIT_BETWEEN_KEYWORDS)
-                            logging.info(f"   ⏳ Chờ {wait:.1f}s...")
-                            time.sleep(wait)
+                            for doc in docs:
+                                doc_url = str(doc.get("url", "")).strip()
+                                if doc_url and doc_url not in seen_search_urls:
+                                    seen_search_urls.add(doc_url)
+                                    search_results.append({
+                                        "url": doc_url, "keyword": kw,
+                                        "title": doc.get("title", ""),
+                                    })
 
-                    self.after(0, self._update_progress, len(keywords), len(keywords))
-                    logging.info("✅ Hoàn tất tìm kiếm tất cả keyword.")
+                            if idx < len(keywords):
+                                wait = random.uniform(*WAIT_BETWEEN_KEYWORDS)
+                                logging.info(f"⏳ Chờ {wait:.1f}s...")
+                                time.sleep(wait)
 
-                finally:
+                    finally:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
+
+            # --- Bước 2: Cào từng văn bản ---
+            completed_urls = set(load_progress())
+            all_tasks = (
+                [{"url": u, "keyword": "Direct_URL", "title": u} for u in direct_urls]
+                + search_results
+            )
+            processed = set()
+
+            logging.info(f"📄 Tổng {len(all_tasks)} văn bản cần cào.")
+
+            for i, task in enumerate(all_tasks, 1):
+                if self._check_events():
+                    break
+
+                doc_url = task["url"]
+                kw = task["keyword"]
+                title = task.get("title", "")
+
+                if doc_url in processed:
+                    continue
+                if doc_url in completed_urls:
+                    logging.info(f"⏭️ Bỏ qua (đã cào): {title[:50]}")
+                    continue
+
+                processed.add(doc_url)
+                logging.info(f"📄 [{i}/{len(all_tasks)}] {title[:70]}")
+
+                file_path = None
+                for attempt in range(1, MAX_RETRIES + 1):
                     try:
-                        page.close()
-                    except Exception:
-                        pass
-                    try:
-                        browser.close()
-                    except Exception:
-                        pass
+                        file_path = scrape_url(doc_url, keyword=kw, log_fn=self._log)
+                        if file_path:
+                            break
+                    except Exception as e:
+                        logging.warning(f"⚠️ Lần {attempt}: {e}")
+                        if attempt < MAX_RETRIES:
+                            time.sleep(RETRY_DELAY_SECONDS)
+
+                if file_path:
+                    save_progress(doc_url)
+                    completed_urls.add(doc_url)
+                    self._append_result(title, kw, file_path)
+
+                if i < len(all_tasks):
+                    wait = random.uniform(*WAIT_BETWEEN_URLS)
+                    logging.info(f"  ⏳ Chờ {wait:.1f}s...")
+                    time.sleep(wait)
+
+            self.after(0, self._update_progress, len(keywords), len(keywords))
+            logging.info("🎉 HOÀN THÀNH TOÀN BỘ!")
 
         except Exception as e:
-            logging.error(f"❌ Lỗi Thread Search: {e}")
-
-    # ---- Thread B: Worker cào URL từ SQLite ---------------------------
-
-    def _thread_worker(self):
-        """
-        Vòng lặp liên tục:
-          1. fetch_next_pending() từ SQLite.
-          2. scrape_url().
-          3. mark_done() hoặc mark_error().
-        Thoát khi stop_event hoặc không còn URL pending và search đã xong.
-        """
-        idle_ticks = 0  # Đếm số lần liên tiếp không có URL mới
-        MAX_IDLE = 20   # ~60 giây idle → thoát
-
-        logging.info("⚙️ Worker bắt đầu chờ URL từ hàng chờ SQLite...")
-
-        while not self.stop_event.is_set():
-            if self._check_events():
-                break
-
-            task = db_queue.fetch_next_pending()
-            if task is None:
-                idle_ticks += 1
-                if idle_ticks >= MAX_IDLE:
-                    logging.info("🏁 Worker: Không còn URL pending. Kết thúc.")
-                    break
-                time.sleep(3)
-                continue
-
-            idle_ticks = 0  # reset idle counter
-            doc_url = task["url"]
-            kw = task.get("keyword", "")
-            title = task.get("title", "") or doc_url
-
-            logging.info(f"📄 Worker cào: {title[:70]}")
-
-            file_path = None
-            last_err = ""
-            for attempt in range(1, MAX_RETRIES + 1):
-                try:
-                    file_path = scrape_url(doc_url, keyword=kw, log_fn=self._log)
-                    if file_path:
-                        break
-                    last_err = "scrape_url trả về None"
-                except Exception as e:
-                    last_err = str(e)
-                    logging.warning(f"⚠️ Lần {attempt}: {e}")
-                    if attempt < MAX_RETRIES:
-                        time.sleep(RETRY_DELAY_SECONDS)
-
-            if file_path:
-                db_queue.mark_done(doc_url, file_path=file_path)
-                self._append_result(title, kw, file_path)
-            else:
-                db_queue.mark_error(doc_url, error_msg=last_err)
-                logging.warning(f"❌ Lỗi cào (đánh dấu error): {doc_url[:60]}")
-
-            # Delay giữa các lần cào
-            if not self.stop_event.is_set():
-                wait = random.uniform(*WAIT_BETWEEN_URLS)
-                time.sleep(wait)
-
-        logging.info("🎉 Worker kết thúc.")
-        self.after(0, self._reset_ui)
+            logging.error(f"❌ Lỗi nghiêm trọng: {e}")
+        finally:
+            self.after(0, self._reset_ui)

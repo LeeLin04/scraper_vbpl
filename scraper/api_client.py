@@ -6,7 +6,6 @@ parse dữ liệu streaming JSON trả về từ server VBPL.
 
 FIX: Lỗi bỏ sót dòng index 2 chữ số (10:, 11:...) đã được sửa bằng Regex.
 FIX: Lỗi chồng chất event listener (Listener Stacking) đã được sửa bằng remove_listener.
-NEW: search_documents() giờ trả về field `hieu_luc` (từ effStatus) cho mỗi văn bản.
 """
 
 import json
@@ -16,23 +15,6 @@ import random
 
 from config import BASE_URL, MAX_SEARCH_PAGES
 from utils.text_utils import clean_text
-
-
-# Ánh xạ tên hiệu lực trong API sang giá trị chuẩn hóa
-_EFF_STATUS_MAP = {
-    "còn hiệu lực":             "Còn hiệu lực",
-    "hết hiệu lực một phần":   "Hết hiệu lực một phần",
-    "hết hiệu lực":           "Hết hiệu lực",
-    "chưa có hiệu lực":       "Chưa có hiệu lực",
-    "không xác định":          "Không xác định",
-}
-
-
-def _normalize_hieu_luc(raw: str) -> str:
-    """Chuẩn hóa giá trị hiệu lực từ API, giữ nguyên nếu không khớp."""
-    if not raw:
-        return ""
-    return _EFF_STATUS_MAP.get(raw.strip().lower(), raw.strip())
 
 
 def search_documents(page, keyword: str, log_fn=None) -> list[dict]:
@@ -45,7 +27,7 @@ def search_documents(page, keyword: str, log_fn=None) -> list[dict]:
         5. Bắt API response JSON Next.js streaming (sửa lỗi index 2 chữ số).
         6. Chuyển sang 100 kết quả/trang và phân trang tối đa MAX_SEARCH_PAGES.
 
-    Trả về: Danh sách dict gồm { "title", "url", "status", "hieu_luc" }
+    Trả về: Danh sách dict gồm { "title", "url", "status" }
     """
 
     def log(msg):
@@ -208,13 +190,7 @@ def search_documents(page, keyword: str, log_fn=None) -> list[dict]:
                 if url in unique_urls:
                     continue
                 unique_urls.add(url)
-                hieu_luc = _normalize_hieu_luc(status)
-                documents.append({
-                    "title": title,
-                    "url": url,
-                    "status": status,
-                    "hieu_luc": hieu_luc,
-                })
+                documents.append({"title": title, "url": url, "status": status})
                 new_count += 1
 
         log(f"📌 Bắt được {new_count} văn bản ở trang {current_page}.")
