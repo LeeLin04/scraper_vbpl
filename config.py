@@ -89,5 +89,5 @@ USER_AGENTS = [
 # -------------------------------------------------------------------------
 # THỜI GIAN CHỜ (giây) GIỮA CÁC TÁC VỤ – Để tránh bị VBPL chặn
 # -------------------------------------------------------------------------
-WAIT_BETWEEN_KEYWORDS = (4, 8)   # random.uniform(min, max)
-WAIT_BETWEEN_URLS     = (2, 6)   # random.uniform(min, max)
+WAIT_BETWEEN_KEYWORDS = (1, 3)   # random.uniform(min, max)
+WAIT_BETWEEN_URLS     = (1, 4)   # random.uniform(min, max)
